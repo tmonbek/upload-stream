@@ -1,3 +1,4 @@
+import busboy from 'busboy';
 import cors from 'cors';
 import express, { Request, Response } from 'express';
 import fs from 'fs';
@@ -22,39 +23,44 @@ if (!fs.existsSync(CHUNK_DIR)) {
 }
 
 app.post('/ufs/:filename', async (req: Request, res: Response) => {
-  const fileDir = path.join(CHUNK_DIR, req.params.filename);
-  const writeStream = fs.createWriteStream(fileDir, {
-    flags: 'a',
-    encoding: 'binary',
-  });
+  const bb = busboy({ headers: req.headers });
+  bb.on('file', (file, info) => {
+    const { filename } = info;
 
-  req.on('data', (chunk) => {
-    console.log((chunk.length / 1024).toFixed(2), 'KB');
-    writeStream.write(chunk);
-  });
-
-  req.on('end', () => {
-    writeStream.end();
-    fs.rename(fileDir, path.join(UPLOAD_DIR, req.params.filename), (err) => {
-      if (err) {
-        console.log(err);
-        return;
-      }
+    const fileDir = path.join(CHUNK_DIR, filename);
+    const writeStream = fs.createWriteStream(fileDir, {
+      flags: 'a',
     });
+
+    file
+      .on('data', (data) => {
+        writeStream.write(data);
+      })
+      .on('close', () => {
+        fs.rename(fileDir, path.join(UPLOAD_DIR, filename), (err) => {
+          if (err) {
+            console.log(err);
+            return;
+          }
+        });
+        writeStream.end();
+      });
+  });
+
+  bb.on('field', (name, val) => {
+    console.log(`Field [${name}]: value: %j`, val);
+  });
+
+  bb.on('close', () => {
     res.status(200).send('File successfully uploaded!');
   });
 
   req.on('error', (err: Error) => {
-    writeStream.end();
     console.error('Error Request on writing chunk:', err);
     res.status(500).send('Error on uploading chunk!');
   });
 
-  writeStream.on('error', (err: Error) => {
-    writeStream.end();
-    console.error('Error Write on writing chunk:', err);
-    res.status(500).send('Error writing chunk');
-  });
+  req.pipe(bb);
 });
 
 app.get('/chunk-info/:filename', async (req: Request, res: Response) => {
@@ -85,10 +91,11 @@ app.get('/chunk-info/:filename', async (req: Request, res: Response) => {
   });
 });
 
-app.post('/chunk-info/:filename', async (req: Request, res: Response) => {
+app.get('/download/:filename', async (req, res) => {
   const filePath = path.join(UPLOAD_DIR, req.params.filename);
   const receivedSize = req.body.receivedSize;
   const chunkSize = req.body.chunkSize;
+
   if (!fs.existsSync(filePath)) {
     res.status(404).send('File not found');
     return;
@@ -97,11 +104,6 @@ app.post('/chunk-info/:filename', async (req: Request, res: Response) => {
   const fileSize = fs.statSync(filePath).size;
   const extname = path.extname(filePath).toLowerCase();
   const mimeType = mimeTypes[extname] || 'application/octet-stream';
-
-  if (receivedSize >= fileSize) {
-    res.status(416).send('Requested range not satisfiable');
-    return;
-  }
 
   res.setHeader('Content-Length', fileSize);
   res.setHeader('Content-Type', mimeType);
@@ -110,49 +112,9 @@ app.post('/chunk-info/:filename', async (req: Request, res: Response) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
 
   const fileStream = fs.createReadStream(filePath, {
-    start: receivedSize,
+    start: receivedSize || 0,
     highWaterMark: chunkSize || 2 * 1024 * 1024,
   });
-
-  let totalBytesSent = 0;
-
-  fileStream.on('data', (chunk) => {
-    totalBytesSent += chunk.length;
-  });
-
-  res.on('close', () => {
-    res.send(`Connection closed. Total bytes sent before closure: ${totalBytesSent}`);
-  });
-
-  fileStream.on('end', () => {
-    res.send(`File successfully sent. Total bytes sent: ${totalBytesSent}`);
-  });
-
-  fileStream.on('error', (err) => {
-    res.status(500).send('Error reading the file');
-  });
-
-  fileStream.pipe(res);
-});
-
-app.get('/download/:filename', async (req, res) => {
-  const filePath = path.join(UPLOAD_DIR, req.params.filename);
-  if (!fs.existsSync(filePath)) {
-    res.status(404).send('File not found');
-    return;
-  }
-
-  const fileSize = fs.statSync(filePath).size;
-  const extname = path.extname(filePath).toLowerCase();
-  const mimeType = mimeTypes[extname] || 'application/octet-stream';
-
-  res.setHeader('Content-Length', fileSize);
-  res.setHeader('Content-Type', mimeType);
-  res.setHeader('Content-Disposition', `inline; filename="${req.params.filename}"`);
-  res.setHeader('Content-Security-Policy', "default-src 'none'");
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-
-  const fileStream = fs.createReadStream(filePath, { highWaterMark: 2 * 1024 * 1024 });
 
   let totalBytesSent = 0;
 
